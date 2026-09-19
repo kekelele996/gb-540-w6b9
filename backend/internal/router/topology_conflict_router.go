@@ -12,6 +12,7 @@ func registerTopologyConflictRoutes(api *gin.RouterGroup, deps Dependencies) {
 	conflicts.GET("", h.ListConflicts)
 	conflicts.GET("/:id", h.GetConflict)
 	conflicts.POST("/detect", appmw.RateLimitMiddleware(deps.AnalyzeLimiter, "conflict_detection"), appmw.RBACMiddleware(constants.RoleGISAnalyst, constants.RoleAdmin), h.DetectConflicts)
+	conflicts.POST("/apply-batch", appmw.RateLimitMiddleware(deps.AnalyzeLimiter, "conflict_batch_apply"), appmw.RBACMiddleware(constants.RoleReviewer, constants.RoleAdmin), h.ApplyConflictBatch)
 	conflicts.POST("/:id/transition", appmw.RBACMiddleware(constants.RoleReviewer, constants.RoleAdmin), h.TransitionConflict)
 	conflicts.POST("/:id/apply-suggestion", appmw.RBACMiddleware(constants.RoleReviewer, constants.RoleAdmin), h.ApplyConflictSuggestion)
 }

@@ -3,6 +3,7 @@ import type { ConflictType } from './enums/conflict-type'
 export interface TopologyConflict {
   id: number
   proposal_id: number
+  detection_run_id: number
   parcel_ids: number[]
   conflict_type: ConflictType
   geometry_geojson: string

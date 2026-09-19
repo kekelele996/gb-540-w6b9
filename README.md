@@ -80,11 +80,12 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
 | `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
+| `POST` | `/conflicts/apply-batch` | Dispose one detection run at once; requires an `Idempotency-Key` header |
 | `GET` | `/audit` | Read immutable audit events |
 
 `/healthz` is liveness; `/readyz` verifies database readiness.
 
-The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by the backend as a JSON array encoded in text and is normalized to a numeric array in the conflict API client before pages or Pinia consume it, so every participating parcel can be labeled consistently.
+The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by the backend as a JSON array encoded in text and is normalized to a numeric array in the conflict API client before pages or Pinia consume it, so every participating parcel can be labeled consistently. Each conflict also carries the `detection_run_id` of the run that produced it; the conflicts page groups multi-conflict runs into batch bars so the reviewer concludes and applies them as one atomic disposition.
 
 ## Shared Enums And State
 
@@ -101,6 +102,8 @@ The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by
 The independent Gin middleware files are `request_id.go`, `recovery.go`, `auth.go`, `rbac.go`, `audit.go`, and `error_handler.go`. They establish request correlation and audit context before authentication, enforce authorization and rate limits, recover panics, and retain a uniform JSON fallback for recorded Gin errors.
 
 Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion creates a new draft proposal version and resolves the source conflict; it does not rewrite the original proposal or parcel boundary.
+
+When one detection run produces several conflicts, the reviewer disposes the whole run as a unit. Every conflict in the batch must first be concluded (`confirmed`, `false_positive`, or `resolution_proposed`) and at least one must carry a proposed resolution; only then can the batch be applied. `POST /conflicts/apply-batch` takes the `detection_run_id` shared by the batch, creates exactly one new draft proposal from the shared snapped suggestion, and moves every confirmed or proposed conflict in the run to `resolved` while false positives stay untouched. The draft, conflict transitions, idempotency record, and audit entries commit in a single transaction, so any failed disposition leaves all of them unchanged and a refresh re-reads a consistent state. `Idempotency-Key` is required (1-128 characters): replaying the same actor/key/request returns the originally created draft and batch states, reusing the key with a different request returns `409`, and duplicate or concurrent applications of the same run succeed at most once.
 
 ## Coordinates And Legal Boundary
 

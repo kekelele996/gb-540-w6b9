@@ -24,6 +24,16 @@ export interface ApplySuggestionInput {
   rationale?: string
 }
 
+export interface ApplyBatchInput {
+  detection_run_id: number
+  rationale?: string
+}
+
+export interface ApplyBatchResult {
+  proposal: BoundaryProposal
+  conflicts: TopologyConflictWire[]
+}
+
 function newIdempotencyKey() {
   return crypto.randomUUID()
 }
@@ -49,4 +59,17 @@ export const topologyConflictApi = {
   },
   applySuggestion: (id: number, body: ApplySuggestionInput = {}) =>
     api.post<ApiEnvelope<BoundaryProposal>>(`/conflicts/${id}/apply-suggestion`, body),
+  async applyBatch(body: ApplyBatchInput, idempotencyKey: string = newIdempotencyKey()) {
+    const response = await api.post<ApiEnvelope<ApplyBatchResult>>('/conflicts/apply-batch', body, {
+      headers: { 'Idempotency-Key': idempotencyKey },
+    })
+    const result = response.data.data
+    return {
+      ...response,
+      data: {
+        ...response.data,
+        data: { proposal: result.proposal, conflicts: result.conflicts.map(normalizeTopologyConflict) },
+      },
+    }
+  },
 }

@@ -40,6 +40,8 @@ func newAuditTestRouter(t *testing.T) (*gin.Engine, *service.CadastralService, *
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	// Match the production engine so handlers always see a request id.
+	engine.Use(appmw.RequestIDMiddleware())
 	Register(engine, Dependencies{
 		AuthHandler:      handler.NewAuthHandler(authService, validate),
 		AuditHandler:     handler.NewAuditHandler(auditService),

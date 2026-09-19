@@ -93,6 +93,17 @@ func (r *TopologyConflictRepository) Transition(id uint, from, to string, resolv
 // TopologyDetectionRunRepository owns idempotency records for conflict detection.
 type TopologyDetectionRunRepository struct{ db *gorm.DB }
 
+func (r *TopologyDetectionRunRepository) Get(id uint) (model.TopologyDetectionRun, error) {
+	var item model.TopologyDetectionRun
+	if err := r.db.First(&item, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("get detection run: %w", err)
+	}
+	return item, nil
+}
+
 func (r *TopologyDetectionRunRepository) GetByActorKey(actorID uint, key string) (model.TopologyDetectionRun, error) {
 	var item model.TopologyDetectionRun
 	if err := r.db.Where("actor_id = ? AND idempotency_key = ?", actorID, key).First(&item).Error; err != nil {
@@ -107,6 +118,38 @@ func (r *TopologyDetectionRunRepository) GetByActorKey(actorID uint, key string)
 func (r *TopologyDetectionRunRepository) Create(item *model.TopologyDetectionRun) error {
 	if err := r.db.Create(item).Error; err != nil {
 		return fmt.Errorf("create topology detection run: %w", err)
+	}
+	return nil
+}
+
+func (r *TopologyDetectionRunRepository) UpdateResultIDs(id uint, resultIDs string) error {
+	result := r.db.Model(&model.TopologyDetectionRun{}).Where("id = ?", id).Update("result_ids", resultIDs)
+	if result.Error != nil {
+		return fmt.Errorf("update detection run results: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("update detection run results: %w", ErrNotFound)
+	}
+	return nil
+}
+
+// TopologyBatchApplyRunRepository owns idempotency records for batch dispositions.
+type TopologyBatchApplyRunRepository struct{ db *gorm.DB }
+
+func (r *TopologyBatchApplyRunRepository) GetByActorKey(actorID uint, key string) (model.TopologyBatchApplyRun, error) {
+	var item model.TopologyBatchApplyRun
+	if err := r.db.Where("actor_id = ? AND idempotency_key = ?", actorID, key).First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("find batch apply idempotency key: %w", err)
+	}
+	return item, nil
+}
+
+func (r *TopologyBatchApplyRunRepository) Create(item *model.TopologyBatchApplyRun) error {
+	if err := r.db.Create(item).Error; err != nil {
+		return fmt.Errorf("create topology batch apply run: %w", err)
 	}
 	return nil
 }

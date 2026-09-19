@@ -75,3 +75,16 @@ func (h *CadastralHandler) ApplyConflictSuggestion(c *gin.Context) {
 	}
 	ok(c, http.StatusCreated, item, nil)
 }
+
+func (h *CadastralHandler) ApplyConflictBatch(c *gin.Context) {
+	var req dto.ApplyConflictBatchRequest
+	if !bind(c, h.validate, &req) {
+		return
+	}
+	proposal, items, err := h.service.ApplyConflictBatch(req, c.GetHeader("Idempotency-Key"), actor(c))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	ok(c, http.StatusCreated, dto.ConflictBatchApplyResult{Proposal: proposal, Conflicts: items}, nil)
+}

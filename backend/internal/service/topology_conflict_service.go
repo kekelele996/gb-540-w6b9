@@ -103,25 +103,28 @@ func (s *CadastralService) DetectConflicts(req dto.DetectConflictRequest, idempo
 		})
 	}
 	err = s.store.Transaction(func(tx *repository.Store) error {
+		run := model.TopologyDetectionRun{ProposalID: proposal.ID, ActorID: actor.ID, IdempotencyKey: key, RequestHash: requestHash, InputHash: inputHash, ResultIDs: "[]"}
+		if createErr := tx.DetectionRuns.Create(&run); createErr != nil {
+			return createErr
+		}
+		resultIDs := make([]uint, 0, len(items))
 		for index := range items {
+			items[index].DetectionRunID = run.ID
 			if createErr := tx.Conflicts.Create(&items[index]); createErr != nil {
 				return createErr
 			}
+			resultIDs = append(resultIDs, items[index].ID)
 			if auditErr := tx.Audits.Create(audit(actor, "conflict.detected", "TopologyConflict", items[index].ID, &parcel.ID, "{}", snapshot(items[index]))); auditErr != nil {
 				return auditErr
 			}
-		}
-		resultIDs := make([]uint, 0, len(items))
-		for _, item := range items {
-			resultIDs = append(resultIDs, item.ID)
 		}
 		encodedIDs, encodeErr := json.Marshal(resultIDs)
 		if encodeErr != nil {
 			return encodeErr
 		}
-		run := model.TopologyDetectionRun{ProposalID: proposal.ID, ActorID: actor.ID, IdempotencyKey: key, RequestHash: requestHash, InputHash: inputHash, ResultIDs: string(encodedIDs)}
-		if createErr := tx.DetectionRuns.Create(&run); createErr != nil {
-			return createErr
+		run.ResultIDs = string(encodedIDs)
+		if updateErr := tx.DetectionRuns.UpdateResultIDs(run.ID, run.ResultIDs); updateErr != nil {
+			return updateErr
 		}
 		return tx.Audits.Create(audit(actor, "conflict.detection_completed", "TopologyDetectionRun", run.ID, &proposal.ID, "{}", snapshot(run)))
 	})
@@ -253,6 +256,14 @@ func (s *CadastralService) replayDetectionRun(run model.TopologyDetectionRun, re
 	if run.RequestHash != requestHash {
 		return nil, conflict("Idempotency-Key has already been used with a different request", nil)
 	}
+	items, err := s.detectionRunConflicts(run)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *CadastralService) detectionRunConflicts(run model.TopologyDetectionRun) ([]model.TopologyConflict, error) {
 	var resultIDs []uint
 	if err := json.Unmarshal([]byte(run.ResultIDs), &resultIDs); err != nil {
 		return nil, internal("stored idempotency result is invalid", err)
@@ -262,6 +273,154 @@ func (s *CadastralService) replayDetectionRun(run model.TopologyDetectionRun, re
 		return nil, internal("load idempotent detection result failed", err)
 	}
 	return items, nil
+}
+
+// ApplyConflictBatch disposes one detection run as a unit: every conflict must
+// already be concluded (confirmed, false_positive, or resolution_proposed) and
+// at least one must carry a proposed resolution. It creates exactly one new
+// draft proposal from the shared snapped suggestion, resolves every confirmed
+// or proposed conflict in the batch, and leaves false positives untouched. The
+// draft, conflict transitions, idempotency record, and audit entries commit in
+// a single transaction, so any failure leaves all of them unchanged.
+func (s *CadastralService) ApplyConflictBatch(req dto.ApplyConflictBatchRequest, idempotencyKey string, actor Actor) (model.BoundaryProposal, []model.TopologyConflict, error) {
+	key := strings.TrimSpace(idempotencyKey)
+	if key == "" || len(key) > 128 {
+		return model.BoundaryProposal{}, nil, invalid("Idempotency-Key must contain between 1 and 128 characters", nil)
+	}
+	if err := requireAnyRole(actor, constants.RoleReviewer, constants.RoleAdmin); err != nil {
+		return model.BoundaryProposal{}, nil, err
+	}
+	rationale := strings.TrimSpace(req.Rationale)
+	requestHash := geometry.Hash(strconv.FormatUint(uint64(req.DetectionRunID), 10), rationale)
+	if existing, findErr := s.store.BatchApplyRuns.GetByActorKey(actor.ID, key); findErr == nil {
+		return s.replayBatchApply(existing, requestHash)
+	} else if !errors.Is(findErr, repository.ErrNotFound) {
+		return model.BoundaryProposal{}, nil, internal("check batch apply idempotency failed", findErr)
+	}
+
+	run, err := s.store.DetectionRuns.Get(req.DetectionRunID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return model.BoundaryProposal{}, nil, notFound("detection run")
+	}
+	if err != nil {
+		return model.BoundaryProposal{}, nil, internal("load detection run failed", err)
+	}
+	items, err := s.detectionRunConflicts(run)
+	if err != nil {
+		return model.BoundaryProposal{}, nil, err
+	}
+	if len(items) == 0 {
+		return model.BoundaryProposal{}, nil, conflict("the detection run has no conflicts to dispose", nil)
+	}
+	proposed := 0
+	for _, item := range items {
+		switch item.ConflictState {
+		case constants.ConflictConfirmed, constants.ConflictFalsePositive:
+		case constants.ConflictResolutionProposed:
+			proposed++
+		default:
+			return model.BoundaryProposal{}, nil, conflict(fmt.Sprintf("conflict %d is still %s; every conflict in the batch must be confirmed, marked false positive, or given a proposed resolution before applying", item.ID, item.ConflictState), nil)
+		}
+	}
+	if proposed == 0 {
+		return model.BoundaryProposal{}, nil, conflict("at least one conflict in the batch must have a proposed resolution before applying", nil)
+	}
+	proposal, err := s.store.Proposals.Get(run.ProposalID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return model.BoundaryProposal{}, nil, notFound("proposal")
+	}
+	if err != nil {
+		return model.BoundaryProposal{}, nil, internal("load proposal failed", err)
+	}
+	parcel, err := s.store.Parcels.Get(proposal.ParcelID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return model.BoundaryProposal{}, nil, notFound("parcel")
+	}
+	if err != nil {
+		return model.BoundaryProposal{}, nil, internal("load parcel failed", err)
+	}
+	var snappedGeoJSON json.RawMessage
+	for _, item := range items {
+		if item.ConflictState != constants.ConflictResolutionProposed {
+			continue
+		}
+		var suggestion struct {
+			SnappedGeoJSON json.RawMessage `json:"snapped_geojson"`
+		}
+		if err := json.Unmarshal([]byte(item.SuggestedResolutionJSON), &suggestion); err != nil || len(suggestion.SnappedGeoJSON) == 0 {
+			return model.BoundaryProposal{}, nil, conflict(fmt.Sprintf("conflict %d has no usable snapped-boundary suggestion", item.ID), err)
+		}
+		snappedGeoJSON = suggestion.SnappedGeoJSON
+		break
+	}
+	polygon, parseErr := geometry.ParsePolygon(string(snappedGeoJSON))
+	if parseErr != nil {
+		return model.BoundaryProposal{}, nil, internal("stored suggested geometry is invalid", parseErr)
+	}
+	if rationale == "" {
+		rationale = fmt.Sprintf("Applied batch disposition of detection run %d.", run.ID)
+	}
+	derived := model.BoundaryProposal{
+		ParcelID: proposal.ParcelID, BaseVersion: parcel.BoundaryVersion, ProposedGeoJSON: string(snappedGeoJSON), ObservationIDs: proposal.ObservationIDs,
+		SnapToleranceM: proposal.SnapToleranceM, AreaDeltaSquareM: polygon.Area - parcel.AreaSquareM, ProposalState: constants.ProposalDraft,
+		Rationale: rationale, Version: proposal.Version + 1, CreatedBy: actor.ID,
+	}
+	resolvedBy := actor.ID
+	err = s.store.Transaction(func(tx *repository.Store) error {
+		if createErr := tx.Proposals.Create(&derived); createErr != nil {
+			return createErr
+		}
+		for index := range items {
+			item := items[index]
+			if item.ConflictState == constants.ConflictFalsePositive {
+				continue
+			}
+			if transitionErr := tx.Conflicts.Transition(item.ID, item.ConflictState, constants.ConflictResolved, &resolvedBy); transitionErr != nil {
+				return conflict(fmt.Sprintf("conflict %d changed state while applying the batch; no changes were kept", item.ID), transitionErr)
+			}
+			if auditErr := tx.Audits.Create(audit(actor, "conflict.state_changed", "TopologyConflict", item.ID, &derived.ID, snapshot(item), snapshot(map[string]any{"conflict_state": constants.ConflictResolved, "detection_run_id": run.ID, "proposal_id": derived.ID}))); auditErr != nil {
+				return auditErr
+			}
+		}
+		applyRun := model.TopologyBatchApplyRun{DetectionRunID: run.ID, ProposalID: proposal.ID, ActorID: actor.ID, IdempotencyKey: key, RequestHash: requestHash, CreatedProposalID: derived.ID}
+		if createErr := tx.BatchApplyRuns.Create(&applyRun); createErr != nil {
+			return createErr
+		}
+		if auditErr := tx.Audits.Create(audit(actor, "proposal.created_from_conflict", "BoundaryProposal", derived.ID, &derived.ParcelID, "{}", snapshot(derived))); auditErr != nil {
+			return auditErr
+		}
+		return tx.Audits.Create(audit(actor, "conflict.batch_applied", "TopologyBatchApplyRun", applyRun.ID, &derived.ID, "{}", snapshot(applyRun)))
+	})
+	if err != nil {
+		if existing, findErr := s.store.BatchApplyRuns.GetByActorKey(actor.ID, key); findErr == nil {
+			return s.replayBatchApply(existing, requestHash)
+		}
+		return model.BoundaryProposal{}, nil, wrapCadastral(err, "apply conflict batch failed")
+	}
+	reloaded, reloadErr := s.detectionRunConflicts(run)
+	if reloadErr != nil {
+		return model.BoundaryProposal{}, nil, reloadErr
+	}
+	return derived, reloaded, nil
+}
+
+func (s *CadastralService) replayBatchApply(run model.TopologyBatchApplyRun, requestHash string) (model.BoundaryProposal, []model.TopologyConflict, error) {
+	if run.RequestHash != requestHash {
+		return model.BoundaryProposal{}, nil, conflict("Idempotency-Key has already been used with a different request", nil)
+	}
+	proposal, err := s.store.Proposals.Get(run.CreatedProposalID)
+	if err != nil {
+		return model.BoundaryProposal{}, nil, internal("load idempotent batch apply proposal failed", err)
+	}
+	detectionRun, err := s.store.DetectionRuns.Get(run.DetectionRunID)
+	if err != nil {
+		return model.BoundaryProposal{}, nil, internal("load idempotent batch apply run failed", err)
+	}
+	items, err := s.detectionRunConflicts(detectionRun)
+	if err != nil {
+		return model.BoundaryProposal{}, nil, err
+	}
+	return proposal, items, nil
 }
 
 func canTransitionObservation(from, to string) bool {
