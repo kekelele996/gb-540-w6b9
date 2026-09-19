@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"cadastral-boundary-topology-resolution/backend/internal/config"
 	"cadastral-boundary-topology-resolution/backend/internal/constants"
@@ -19,6 +21,40 @@ import (
 
 var ErrNotFound = errors.New("record not found")
 
+// retryOnSQLiteBusy works around the single-writer limitation of the in-memory
+// SQLite runtime-smoke database when concurrent requests contend for a table
+// lock outside an explicit transaction. PostgreSQL uses MVCC and never hits
+// this path, so the helper only backs off for SQLite "database is locked"
+// style errors.
+func retryOnSQLiteBusy(db *gorm.DB, fn func() error) error {
+	const attempts = 50
+	for attempt := 0; attempt < attempts; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if db.Dialector.Name() != "sqlite" || !isSQLiteBusy(err) || attempt == attempts-1 {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Millisecond)
+	}
+	return nil
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database table is locked") || strings.Contains(message, "database is locked")
+}
+
+// SQLite (used by the in-memory runtime smoke) allows only one writer at a
+// time. Serializing write transactions in-process removes non-deterministic
+// "table is locked" errors without weakening the conditional updates or the
+// idempotency guarantees; production PostgreSQL uses MVCC and skips this lock.
+var sqliteWriteMu sync.Mutex
+
 type Store struct {
 	DB            *gorm.DB
 	Users         *UserRepository
@@ -28,6 +64,7 @@ type Store struct {
 	Proposals     *BoundaryProposalRepository
 	Conflicts     *TopologyConflictRepository
 	DetectionRuns *TopologyDetectionRunRepository
+	ReviewBatches *ConflictReviewBatchRepository
 }
 
 func Open(cfg config.Config) (*gorm.DB, error) {
@@ -60,10 +97,15 @@ func NewStore(db *gorm.DB) *Store {
 		Proposals:     &BoundaryProposalRepository{db},
 		Conflicts:     &TopologyConflictRepository{db},
 		DetectionRuns: &TopologyDetectionRunRepository{db},
+		ReviewBatches: &ConflictReviewBatchRepository{db},
 	}
 }
 
 func (s *Store) Transaction(fn func(*Store) error) error {
+	if s.DB.Dialector.Name() == "sqlite" {
+		sqliteWriteMu.Lock()
+		defer sqliteWriteMu.Unlock()
+	}
 	return s.DB.Transaction(func(tx *gorm.DB) error { return fn(NewStore(tx)) })
 }
 
@@ -79,7 +121,7 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func MigrateAndSeed(db *gorm.DB) error {
-	if err := db.AutoMigrate(&model.User{}, &model.AuditLog{}, &model.LandParcel{}, &model.SurveyObservation{}, &model.BoundaryProposal{}, &model.TopologyConflict{}, &model.TopologyDetectionRun{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.AuditLog{}, &model.LandParcel{}, &model.SurveyObservation{}, &model.BoundaryProposal{}, &model.TopologyConflict{}, &model.TopologyDetectionRun{}, &model.ConflictReviewBatch{}, &model.ConflictDisposition{}, &model.ConflictBatchApplication{}); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
 	// Existing installations may have been created before the cadastral RBAC roles

@@ -20,11 +20,11 @@ func serviceTestPolygon(points string) string {
 
 func newCadastralTestService(t *testing.T) (*CadastralService, *repository.Store) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared&_busy_timeout=5000"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open SQLite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.User{}, &model.AuditLog{}, &model.LandParcel{}, &model.SurveyObservation{}, &model.BoundaryProposal{}, &model.TopologyConflict{}, &model.TopologyDetectionRun{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.AuditLog{}, &model.LandParcel{}, &model.SurveyObservation{}, &model.BoundaryProposal{}, &model.TopologyConflict{}, &model.TopologyDetectionRun{}, &model.ConflictReviewBatch{}, &model.ConflictDisposition{}, &model.ConflictBatchApplication{}); err != nil {
 		t.Fatalf("migrate SQLite: %v", err)
 	}
 	store := repository.NewStore(db)

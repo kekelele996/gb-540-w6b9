@@ -80,6 +80,10 @@ All endpoints below except login and health checks require `Authorization: Beare
 | `POST` | `/conflicts/detect` | Run detection; requires an `Idempotency-Key` header |
 | `POST` | `/conflicts/:id/transition` | Confirm, mark false positive, propose resolution, or close a conflict |
 | `POST` | `/conflicts/:id/apply-suggestion` | Create a new draft proposal from the reviewed suggestion and resolve the source conflict |
+| `GET` | `/conflict-review-batches` | Read the unified review batch for a proposal (`?proposal_id=`) |
+| `GET` | `/conflict-review-batches/:id` | Read a batch, its conflicts and saved conclusions (refresh-safe) |
+| `POST` | `/conflict-review-batches/:id/dispositions` | Save reviewer conclusions (confirm / false positive / snap suggestion) for the batch |
+| `POST` | `/conflict-review-batches/:id/apply` | Apply the batch once: create one draft and resolve batch conflicts; requires `Idempotency-Key` |
 | `GET` | `/audit` | Read immutable audit events |
 
 `/healthz` is liveness; `/readyz` verifies database readiness.
@@ -101,6 +105,18 @@ The frontend sends every request through `/api/v1`. `parcel_ids` is persisted by
 The independent Gin middleware files are `request_id.go`, `recovery.go`, `auth.go`, `rbac.go`, `audit.go`, and `error_handler.go`. They establish request correlation and audit context before authentication, enforce authorization and rate limits, recover panics, and retain a uniform JSON fallback for recorded Gin errors.
 
 Allowed proposal flow is `draft -> validated -> submitted -> reviewed -> accepted/rejected`, with `reviewed -> revision -> draft`. Illegal transitions return `409`; an author cannot review their own proposal. Conflict flow is `detected -> confirmed -> resolution_proposed -> resolved -> closed`, with the alternate `detected -> false_positive -> closed` path. Applying a reviewed suggestion creates a new draft proposal version and resolves the source conflict; it does not rewrite the original proposal or parcel boundary.
+
+### Unified batch review
+
+When one detection run produces several conflicts, the reviewer disposes of the whole result set as one unit through a `ConflictReviewBatch`:
+
+1. Every conflict must carry a conclusion — `confirmed`, `false_positive`, or `resolution_proposed` (the deterministic snap suggestion). Conclusions are saved to the batch and survive a page refresh; while the batch is open a reviewer may revise a conclusion before applying.
+2. At least one conflict must propose the snap suggestion. Applying before every conflict has a conclusion returns `409` and creates nothing.
+3. Applying the batch is a single transaction: it creates exactly one new draft proposal from the chosen snap suggestion and moves every other confirmed (plus the suggestion-bearing) conflict to `resolved`. False-positive conflicts keep their conclusion and are not resolved by the apply.
+4. Application requires a 1–128 char `Idempotency-Key`. Replaying the same actor/key returns the stored draft (`replayed: true`); a concurrent or duplicate request with a different key receives `409`. The conditional batch transition plus the unique application index guarantee a single committed application.
+5. If any disposition or apply step fails, the transaction rolls back: the draft, conflict states, batch state and audit records stay exactly as they were.
+
+Batch lifecycle is `open -> applied` (an `open -> closed` terminal is reserved for abandoning a batch without action). Batch read endpoints are visible to `reviewer`, `gis_analyst` and `admin` for collaboration; only `reviewer`/`admin` may save conclusions or apply.
 
 ## Coordinates And Legal Boundary
 

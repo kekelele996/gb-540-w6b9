@@ -7,6 +7,7 @@ import (
 	"cadastral-boundary-topology-resolution/backend/internal/dto"
 	"cadastral-boundary-topology-resolution/backend/internal/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // TopologyConflictRepository stores immutable findings and their lifecycle.
@@ -35,7 +36,9 @@ func (r *TopologyConflictRepository) ListByIDs(ids []uint) ([]model.TopologyConf
 		return []model.TopologyConflict{}, nil
 	}
 	var items []model.TopologyConflict
-	if err := r.db.Where("id IN ?", ids).Find(&items).Error; err != nil {
+	if err := retryOnSQLiteBusy(r.db, func() error {
+		return r.db.Where("id IN ?", ids).Find(&items).Error
+	}); err != nil {
 		return nil, fmt.Errorf("find topology conflicts by ids: %w", err)
 	}
 	byID := make(map[uint]model.TopologyConflict, len(items))
@@ -109,4 +112,127 @@ func (r *TopologyDetectionRunRepository) Create(item *model.TopologyDetectionRun
 		return fmt.Errorf("create topology detection run: %w", err)
 	}
 	return nil
+}
+
+func (r *TopologyDetectionRunRepository) Get(id uint) (model.TopologyDetectionRun, error) {
+	var item model.TopologyDetectionRun
+	if err := r.db.First(&item, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("get detection run: %w", err)
+	}
+	return item, nil
+}
+
+// GetLatestByProposal returns the most recent detection run for a proposal.
+func (r *TopologyDetectionRunRepository) GetLatestByProposal(proposalID uint) (model.TopologyDetectionRun, error) {
+	var item model.TopologyDetectionRun
+	if err := r.db.Where("proposal_id = ?", proposalID).Order("id DESC").First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("get latest detection run: %w", err)
+	}
+	return item, nil
+}
+
+// ConflictReviewBatchRepository persists unified review batches, their
+// per-conflict conclusions and idempotent application records.
+type ConflictReviewBatchRepository struct{ db *gorm.DB }
+
+func (r *ConflictReviewBatchRepository) Create(item *model.ConflictReviewBatch) error {
+	if err := r.db.Create(item).Error; err != nil {
+		return fmt.Errorf("create conflict review batch: %w", err)
+	}
+	return nil
+}
+
+func (r *ConflictReviewBatchRepository) Get(id uint) (model.ConflictReviewBatch, error) {
+	var item model.ConflictReviewBatch
+	if err := retryOnSQLiteBusy(r.db, func() error {
+		return r.db.First(&item, id).Error
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("get conflict review batch: %w", err)
+	}
+	return item, nil
+}
+
+func (r *ConflictReviewBatchRepository) GetByDetectionRun(runID uint) (model.ConflictReviewBatch, error) {
+	var item model.ConflictReviewBatch
+	if err := r.db.Where("detection_run_id = ?", runID).First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("get batch by detection run: %w", err)
+	}
+	return item, nil
+}
+
+// Transition performs a conditional state update so concurrent applications
+// cannot both move an open batch to applied.
+func (r *ConflictReviewBatchRepository) Transition(id uint, from, to string, updates map[string]any) error {
+	updates["batch_state"] = to
+	result := r.db.Model(&model.ConflictReviewBatch{}).Where("id = ? AND batch_state = ?", id, from).Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("transition conflict review batch: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("review batch state changed: %w", gorm.ErrInvalidTransaction)
+	}
+	return nil
+}
+
+func (r *ConflictReviewBatchRepository) ListOpenByProposal(proposalID uint) ([]model.ConflictReviewBatch, error) {
+	var items []model.ConflictReviewBatch
+	if err := r.db.Where("proposal_id = ? AND batch_state = ?", proposalID, "open").Order("id DESC").Find(&items).Error; err != nil {
+		return nil, fmt.Errorf("list open review batches: %w", err)
+	}
+	return items, nil
+}
+
+// UpsertDisposition stores exactly one conclusion per (batch, conflict). The
+// unique index and the database-level upsert enforce the invariant even under
+// concurrent requests.
+func (r *ConflictReviewBatchRepository) UpsertDisposition(item *model.ConflictDisposition) error {
+	if err := r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "batch_id"}, {Name: "conflict_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"decision", "review_note", "reviewer_id", "updated_at"}),
+	}).Create(item).Error; err != nil {
+		return fmt.Errorf("upsert conflict disposition: %w", err)
+	}
+	return nil
+}
+
+func (r *ConflictReviewBatchRepository) ListDispositions(batchID uint) ([]model.ConflictDisposition, error) {
+	var items []model.ConflictDisposition
+	if err := retryOnSQLiteBusy(r.db, func() error {
+		return r.db.Where("batch_id = ?", batchID).Order("conflict_id ASC").Find(&items).Error
+	}); err != nil {
+		return nil, fmt.Errorf("list conflict dispositions: %w", err)
+	}
+	return items, nil
+}
+
+func (r *ConflictReviewBatchRepository) CreateApplication(item *model.ConflictBatchApplication) error {
+	if err := r.db.Create(item).Error; err != nil {
+		return fmt.Errorf("create batch application: %w", err)
+	}
+	return nil
+}
+
+func (r *ConflictReviewBatchRepository) GetApplication(actorID uint, key string) (model.ConflictBatchApplication, error) {
+	var item model.ConflictBatchApplication
+	if err := retryOnSQLiteBusy(r.db, func() error {
+		return r.db.Where("actor_id = ? AND idempotency_key = ?", actorID, key).First(&item).Error
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, ErrNotFound
+		}
+		return item, fmt.Errorf("find batch application: %w", err)
+	}
+	return item, nil
 }
